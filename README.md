@@ -353,3 +353,41 @@ When you hit **PLAY**, the JS polling routine pulls telemetry from the Rust queu
 - **Decent Player Source Code:** [Ma145 / decent-player on GitHub](https://github.com/Ma145/decent-player)
 - **Vox Machina Engine Discussion:** [Audio Science Review Forum - Vox Machina Bit-Perfect Proof](https://www.audiosciencereview.com/forum/index.php?threads/vox-machina-android-usb-dac-engine-bit-perfect-proven-live-byte-by-byte-closed-beta-seeking-scrutiny.71011/)
 - **USB Audio Class 2.0 Specifications:** [USB-IF Official Documentations](https://www.usb.org/documents)
+
+---
+
+## 7. KNOWN CHALLENGES
+
+Bypassing the entire operating system stack to talk directly to USB hardware is a brutalist engineering choice. If you attempt to compile this, understand that you are running a kernel driver in user-space. 
+
+Here is why this will probably blow up your speakers if you aren't careful:
+
+### I. Isochronous Hell (The Packet Juggling Act)
+Unlike bulk transfers, USB Audio Class 2.0 (UAC2) uses **Isochronous transfers**. This means you cannot use standard read/write system calls. 
+- You must hand-craft raw `usbdevfs_urb` structures and submit them asynchronously via `ioctl(fd, USBDEVFS_SUBMITURB)`.
+- You must keep a continuous pipeline of 8 to 16 URBs queued in the kernel. 
+- If our user-space thread lags by even **125 microseconds** (one high-speed microframe), the pipeline starves. The DAC will emit a loud, painful digital pop.
+
+### II. The Feedback Loop (Clock Drift)
+Your high-end DAC does not run on the Android TV’s clock; it runs on its own internal crystal oscillator. This is **Asynchronous USB Audio**.
+- The DAC will tell the host exactly how many samples it wants via a dedicated **Feedback Endpoint**.
+- Our Rust driver cannot blindly send a static number of samples. It must constantly read the feedback endpoint and dynamically adjust the payload sizes (e.g., sending 95 samples on one frame, 97 on the next) to prevent buffer drift.
+- Skip this math, and the buffer will overflow or underrun every few minutes, causing rhythmic clicks.
+
+### III. Android OS Thread Scheduling Sandbox
+The stock, unrooted Android Linux kernel does not trust user-space apps. It will not grant our thread `SCHED_FIFO` or `SCHED_RR` (real-time priority) scheduling. 
+- If the Android OS decides to run a background system task, it can preempt our Rust thread for 10ms. 
+- In our world, 10ms of preemption is an eternity. This is why the audio loop must remain 100% lock-free, allocation-free, and JNI-free.
+
+### IV. Kernel Driver Eviction
+Before we can claim the DAC's USB interfaces, we have to forcefully evict the kernel's built-in ALSA driver using `ioctl(fd, USBDEVFS_DISCONNECT)`. On some locked-down vendor forks of Android 11, the OS will aggressively fight back and attempt to reclaim the hardware immediately.
+
+---
+
+### ⚠️ AUDIOPHILE WARNING: PROTECT YOUR EARS
+
+If you mismatch your 24-bit alignment (e.g., shifting the bytes incorrectly by a single position), or if the URB thread undergoes a major underrun, the DAC will not emit "low-quality" music. 
+
+It will emit **maximum-amplitude (0dB FS) raw digital white noise**. 
+
+**DO NOT** test this while wearing headphones, and **DO NOT** connect this to your main power amplifiers during development. Test with a cheap $10 USB-C dongle and an oscilloscope (or cheap throwaway IEMs sitting on your desk) first.
