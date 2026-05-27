@@ -1,6 +1,6 @@
 # Sovereign-Audio (The Rawdog PoC)
 
-> **Status:** The Absolute Minimum Viable Proof of Concept. Pure structural CSS and vanilla JS running in a native Android WebView, bridged to an allocation-free Rust UAC2 driver.
+> **Status:** The Absolute Minimum Viable Proof of Concept. Pure structural CSS and vanilla JS running in a native Android WebView, bridged to an allocation-free Rust UAC2 driver via a strictly minimal Kotlin tollbooth.
 > **Goal:**
 >
 > 1. Hardware Check: If Android 14+ (API 34), use native `AudioTrack` lossless APIs.
@@ -25,9 +25,9 @@ We are porting the UAC2 bypass architecture to **pure Rust** to enforce compiler
 
 ---
 
-## 2. FRONTEND: NATIVE WEBVIEW BRIDGE (`index.html`)
+## 2. FRONTEND: NATIVE WEBVIEW BRIDGE (`assets/index.html`)
 
-We ride classless. The UI is built entirely using native semantic elements and structural CSS selectors. Zero build steps. We run this inside a standard Android `WebView` where the `Android` and `SovereignEngine` objects are injected globally via `@JavascriptInterface`.
+We ride classless. The UI is built entirely using native semantic elements and structural CSS selectors. Zero build steps. We run this inside a standard Android `WebView` where the `Android` and `SovereignEngine` objects are injected globally via native bindings.
 
 ```html
 <!DOCTYPE html>
@@ -43,41 +43,33 @@ We ride classless. The UI is built entirely using native semantic elements and s
 				padding: 2rem;
 				max-width: 800px;
 				margin: 0 auto;
-
 				& > main {
 					display: flex;
 					flex-direction: column;
 					gap: 1.5rem;
-
-					& > button {
-						background: #e6b450;
-						color: #0f1419;
-						border: none;
-						padding: 1rem 2rem;
-						font-size: 1.5rem;
-						font-weight: bold;
-						cursor: pointer;
-						border-radius: 4px;
-
-						&:focus {
-							outline: 3px solid #ffcc66;
-						}
-					}
-
-					& > pre {
-						background: #01060e;
-						border: 1px solid #243347;
-						padding: 1.5rem;
-						height: 350px;
-						overflow-y: auto;
-						white-space: pre-wrap;
-						color: #3efcd6;
-						font-size: 0.9rem;
-					}
+				}
+				& > main > button {
+					background: #e6b450;
+					color: #0f1419;
+					border: none;
+					padding: 1rem 2rem;
+					font-size: 1.5rem;
+					font-weight: bold;
+					cursor: pointer;
+					border-radius: 4px;
+				}
+				& > main > pre {
+					background: #01060e;
+					border: 1px solid #243347;
+					padding: 1.5rem;
+					height: 350px;
+					overflow-y: auto;
+					white-space: pre-wrap;
+					color: #3efcd6;
+					font-size: 0.9rem;
 				}
 			}
 		</style>
-
 		<script type="module">
 			const playBtn = document.querySelector("main > button")
 			const logArea = document.querySelector("main > pre")
@@ -115,7 +107,7 @@ We ride classless. The UI is built entirely using native semantic elements and s
 
 				await SovereignEngine.startPlayback("assets/test_24bit_96khz.flac")
 
-				// Poll the lock-free telemetry queue to keep UI separated from Audio Thread
+				// Poll the lock-free telemetry queue
 				pollInterval = setInterval(async () => {
 					const batchStr = await SovereignEngine.pollTelemetry()
 					if (batchStr) {
@@ -133,8 +125,7 @@ We ride classless. The UI is built entirely using native semantic elements and s
 
 			playBtn.addEventListener("click", async () => {
 				if (!isPlaying) {
-					const success = await initPlayback()
-					if (success) {
+					if (await initPlayback()) {
 						playBtn.textContent = "PAUSE"
 						isPlaying = true
 					}
@@ -150,7 +141,7 @@ We ride classless. The UI is built entirely using native semantic elements and s
 	</head>
 	<body>
 		<main>
-			<h1>Sovereign Audio PoC (Android TV)</h1>
+			<h1>Sovereign Audio PoC</h1>
 			<button autofocus>PLAY</button>
 			<pre>Waiting for physical hardware verification...</pre>
 		</main>
@@ -160,12 +151,82 @@ We ride classless. The UI is built entirely using native semantic elements and s
 
 ---
 
-## 3. BYPASS ENGINE (RUST) (`src/engine.rs`)
+## 3. THE KOTLIN TOLLBOOTH & CAVEMAN BUILD
 
-The Rust bypass uses `rtrb` for allocation-free, lock-free ring buffers.
+You cannot simply `open("/dev/bus/usb/...")` on unrooted Android. The kernel will deny access. We must appease the Android OS by writing the absolute bare minimum Kotlin/Java to trigger the system permission prompt, grab the USB File Descriptor (FD), and throw it across the JNI border to our Rust code.
+
+**Zero Android Studio Slop.** We compile via a simple `Makefile`:
+
+```makefile
+# Makefile
+RUST_ARCH=aarch64-linux-android
+APK_PATH=android/app/build/outputs/apk/debug/app-debug.apk
+
+all: compile-rust build-apk
+
+compile-rust:
+	cd rust-engine && cargo ndk -t $(RUST_ARCH) build --release
+	mkdir -p android/app/src/main/jniLibs/arm64-v8a
+	cp rust-engine/target/$(RUST_ARCH)/release/libengine.so android/app/src/main/jniLibs/arm64-v8a/
+
+build-apk:
+	cd android && ./gradlew assembleDebug
+
+deploy: all
+	adb connect 192.168.1.50:5555
+	adb install -r $(APK_PATH)
+	adb shell am start -n com.rawdog.sovereign/.MainActivity
+```
+
+**The WebView Bouncer (`MainActivity.kt`):**
+
+```kotlin
+package com.rawdog.sovereign
+// ... imports omitted for brevity ...
+
+class MainActivity : Activity() {
+    private lateinit var usbManager: UsbManager
+    init { System.loadLibrary("engine") }
+    external fun startRustEngine(fd: Int, flacPath: String)
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
+
+        // Rawdog the WebView. No XML bloat.
+        val webView = WebView(this).apply {
+            settings.javaScriptEnabled = true
+            addJavascriptInterface(WebAppInterface(), "SovereignEngine")
+            loadUrl("file:///android_asset/index.html")
+        }
+        setContentView(webView)
+    }
+
+    inner class WebAppInterface {
+        @JavascriptInterface
+        fun startPlayback(flacPath: String) {
+            val dac = usbManager.deviceList.values.firstOrNull() ?: return
+            if (usbManager.hasPermission(dac)) {
+                val connection = usbManager.openDevice(dac) ?: return
+                // The Handover: Pass the raw Linux FD to Rust
+                startRustEngine(connection.fileDescriptor, flacPath)
+            } else {
+                // Request OS permission logic...
+            }
+        }
+        // ... pollTelemetry() / stopPlayback() omitted ...
+    }
+}
+```
+
+---
+
+## 4. BYPASS ENGINE (RUST) (`src/engine.rs`)
+
+Once Rust has the File Descriptor, we are in control.
 
 **The Mathematics of Verification:**
-You cannot hash a variable-length FLAC frame (e.g., 4096 samples) and compare it against fixed 1024-byte USB payloads. Thread 1 unpacks the FLAC to a flat PCM buffer, slices it into exact 1024-byte chunks, hashes them, and passes the expected hashes through a synchronization queue to Thread 2. Thread 2 reads the wire buffer, re-hashes it, and fires telemetry into a low-priority queue for the JS UI to poll safely via JNI.
+You cannot hash a variable-length FLAC frame (e.g., 4096 samples) and compare it against fixed 1024-byte USB payloads. Thread 1 unpacks the FLAC to a flat PCM buffer, slices it into exact 1024-byte chunks, hashes them, and passes the expected hashes through a synchronization queue to Thread 2. Thread 2 reads the wire buffer, re-hashes it, and fires telemetry safely to the UI polling queue.
 
 ```rust
 use std::os::unix::io::RawFd;
@@ -182,14 +243,14 @@ pub struct TelemetryEvent {
 }
 
 pub fn start_poc_engine(raw_fd: RawFd, flac_bytes: &'static [u8]) {
-    // Audio Pipe: PCM Data to DAC
+    // 1. Audio Pipe: PCM Data to DAC
     let (mut audio_tx, mut audio_rx) = RingBuffer::<u8>::new(65536);
-    // Hash Pipe: Sync expected hashes between threads
+    // 2. Hash Pipe: Sync expected hashes between threads
     let (mut hash_tx, mut hash_rx) = RingBuffer::<u32>::new(128);
-    // Telemetry Pipe: UI polling queue (NO JVM CALLBACKS DURING AUDIO SUBMISSION)
+    // 3. Telemetry Pipe: UI polling queue (NO JVM CALLBACKS DURING AUDIO SUBMISSION)
     let (mut telem_tx, mut _telem_rx) = RingBuffer::<TelemetryEvent>::new(1024);
 
-    // THREAD 1: Decoder & Source Hasher (Variable to Fixed length)
+    // THREAD 1: Decoder & Source Hasher
     thread::spawn(move || {
         let mut reader = FlacReader::new(flac_bytes).expect("Invalid FLAC asset");
         let mut frame_reader = reader.blocks();
@@ -197,14 +258,12 @@ pub fn start_poc_engine(raw_fd: RawFd, flac_bytes: &'static [u8]) {
         let mut flat_pcm = Vec::with_capacity(65536);
 
         while let Some(Ok(block)) = frame_reader.read_next_or_eof(block_buffer) {
-            // Unpack 24-bit PCM
             for sample in block.samples() {
                 let bytes = sample.to_le_bytes();
                 flat_pcm.extend_from_slice(&bytes[0..3]);
             }
 
             let mut offset = 0;
-            // Align hashes exactly with USB URB 1024-byte payload boundaries
             while flat_pcm.len() - offset >= 1024 {
                 let chunk_data = &flat_pcm[offset..offset + 1024];
                 let src_hash = xxh32(chunk_data, 42);
@@ -218,7 +277,6 @@ pub fn start_poc_engine(raw_fd: RawFd, flac_bytes: &'static [u8]) {
                     }
                     chunk.commit_all();
 
-                    // Feed expected hash to wire thread
                     while hash_tx.push(src_hash).is_err() { thread::yield_now(); }
                 }
                 offset += 1024;
@@ -252,13 +310,9 @@ pub fn start_poc_engine(raw_fd: RawFd, flac_bytes: &'static [u8]) {
                     submit_to_usbfs_ring(raw_fd, &transfer_buf);
                 }
 
-                // Push diagnostic data to queue for Java @JavascriptInterface to poll
                 if !telem_tx.is_full() {
                     let _ = telem_tx.push(TelemetryEvent {
-                        chunk_id,
-                        src_hash,
-                        wire_hash,
-                        is_match: src_hash == wire_hash,
+                        chunk_id, src_hash, wire_hash, is_match: src_hash == wire_hash,
                     });
                 }
                 chunk_id += 1;
@@ -271,15 +325,14 @@ pub fn start_poc_engine(raw_fd: RawFd, flac_bytes: &'static [u8]) {
 
 unsafe fn submit_to_usbfs_ring(_fd: RawFd, _data: &[u8]) {
     // Submits URB structs via ioctl(USBDEVFS_SUBMITURB) and reaps via ioctl(USBDEVFS_REAPURBNDELAY)
-    // Ensures ring buffer continuity to prevent audio underruns.
 }
 ```
 
 ---
 
-## 4. HOW THE DIAGNOSTIC LOG PRINTS LIVE
+## 5. DIAGNOSTIC LOG
 
-When you hit the physical **PLAY** button on your Android TV remote, the JS polling routine pulls telemetry from the Rust queue without locking the audio thread, proving bit-perfectness via real-time checksum matches:
+When you hit **PLAY**, the JS polling routine pulls telemetry from the Rust queue without locking the audio thread:
 
 ```
 [13:25:01.002] Initializing Playback Routine...
@@ -289,16 +342,13 @@ When you hit the physical **PLAY** button on your Android TV remote, the JS poll
 [13:25:04.240] Chunk #1 | Src: 0xA3F109E2 | Wire: 0xA3F109E2 | Bit-Perfect: ✅
 [13:25:04.250] Chunk #2 | Src: 0x48BC910A | Wire: 0x48BC910A | Bit-Perfect: ✅
 [13:25:04.260] Chunk #3 | Src: 0xF90B1E22 | Wire: 0xF90B1E22 | Bit-Perfect: ✅
-[13:25:04.270] Chunk #4 | Src: 0x82DC33C0 | Wire: 0x82DC33C0 | Bit-Perfect: ✅
-[13:25:04.280] Chunk #5 | Src: 0x221A90EF | Wire: 0x221A90EF | Bit-Perfect: ✅
-[13:25:04.290] Chunk #6 | Src: 0x77CB4101 | Wire: 0x77CB4101 | Bit-Perfect: ✅
 ...
 [13:25:10.501] Playback halted. Hardware released.
 ```
 
 ---
 
-## 5. DOCUMENTED REFERENCES & EVIDENCE
+## 6. EVIDENCE & REFERENCES
 
 - **Decent Player Source Code:** [Ma145 / decent-player on GitHub](https://github.com/Ma145/decent-player)
 - **Vox Machina Engine Discussion:** [Audio Science Review Forum - Vox Machina Bit-Perfect Proof](https://www.audiosciencereview.com/forum/index.php?threads/vox-machina-android-usb-dac-engine-bit-perfect-proven-live-byte-by-byte-closed-beta-seeking-scrutiny.71011/)
